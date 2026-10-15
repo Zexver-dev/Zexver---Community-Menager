@@ -1,0 +1,17 @@
+
+{
+  "name": "zexver-community-manager",
+  "version": "1.0.0",
+  "description": "Zexver Community Manager Discord bot",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "discord.js": "^14.24.2"
+  }
+}
+  
