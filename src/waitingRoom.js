@@ -575,7 +575,7 @@ module.exports = function setupWaitingRoom(client) {
         }
     });
 
-    client.once("ready", () => {
+    client.once("clientReady", () => {
         console.log("[WaitingRoom] Uruchamianie modułu poczekalni...");
         void connectToWaitingRoom();
     });
