@@ -3,580 +3,499 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
+// Make the bundled FFmpeg executable available to the audio library.
+try {
+  const ffmpegPath = require("ffmpeg-static");
+
+  if (ffmpegPath) {
+    process.env.PATH =
+      `${path.dirname(ffmpegPath)}${path.delimiter}${process.env.PATH || ""}`;
+  }
+} catch (error) {
+  console.error("[WaitingRoom] FFmpeg setup failed:", error.message);
+}
+
 const {
-    joinVoiceChannel,
-    createAudioPlayer,
-    createAudioResource,
-    AudioPlayerStatus,
-    VoiceConnectionStatus,
-    entersState
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayerStatus,
+  VoiceConnectionStatus,
+  entersState
 } = require("@discordjs/voice");
 
-// =============================================
-// ZEXVER COMMUNITY MANAGER — WAITING ROOM
-// =============================================
+// --------------------------------------------------
+// CONFIGURATION
+// --------------------------------------------------
 
-const WAITING_VOICE_CHANNEL_ID = "1560340357919539240";
-const NOTIFICATION_TEXT_CHANNEL_ID = "1560695688902344925";
+const VOICE_CHANNEL_ID = "1560340357919539240";
+const NOTIFICATION_CHANNEL_ID = "1560695688902344925";
 const NOTIFICATION_ROLE_ID = "1559585704177049600";
 
-// Role uprawnione do /announce.
-// Osoba z dowolną z tych ról może przejąć obsługę.
+// Same role IDs as /announce in index.js.
 const ANNOUNCEMENT_ROLE_IDS = [
-    "1559581706929840198",
-    "1559581789306228736",
-    "1559581840908484608",
-    "1559581895531044945",
-    "1559581952103813270",
-    "1559582187869704233",
-    "1559582256731922562"
+  "1559581706929840198",
+  "1559581789306228736",
+  "1559581840908484608",
+  "1559581895531044945",
+  "1559581952103813270",
+  "1559582187869704233",
+  "1559582256731922562"
 ];
 
 const SUPPORT_ROLE_IDS = new Set([
-    NOTIFICATION_ROLE_ID,
-    ...ANNOUNCEMENT_ROLE_IDS
+  NOTIFICATION_ROLE_ID,
+  ...ANNOUNCEMENT_ROLE_IDS
 ]);
 
-// Plik audio leży w głównym folderze repozytorium.
-// Nazwa odpowiada plikowi waiting-room.wav.wav.
-const MUSIC_FILE_PATH = path.join(
-    __dirname,
-    "..",
-    "waiting-room.wav.wav"
+// Audio file is stored in the repository root.
+const MUSIC_FILE = path.join(
+  __dirname,
+  "..",
+  "waiting-room.wav.wav"
 );
 
 const FIRST_NOTIFICATION_DELAY = 10_000;
 const REMINDER_INTERVAL = 5 * 60 * 1000;
-const RECONNECT_DELAY = 5_000;
+const CONNECTION_RETRY_DELAY = 5_000;
+const NOTIFICATION_RETRY_DELAY = 60_000;
+
+// --------------------------------------------------
+// MODULE
+// --------------------------------------------------
 
 module.exports = function setupWaitingRoom(client) {
-    // Zabezpieczenie przed przypadkowym podłączeniem modułu dwa razy.
-    if (client.__zexverWaitingRoomLoaded) return;
-    client.__zexverWaitingRoomLoaded = true;
+  if (client.__zexverWaitingRoomLoaded) return;
+  client.__zexverWaitingRoomLoaded = true;
 
-    const player = createAudioPlayer();
+  const player = createAudioPlayer();
 
-    let voiceChannel = null;
-    let connection = null;
+  let voiceChannel = null;
+  let connection = null;
+  let connectPromise = null;
+  let reconnectTimer = null;
+  let notificationTimer = null;
+  let musicLoopTimer = null;
 
-    let connecting = false;
-    let recovering = false;
-    let reconnectTimer = null;
-    let musicLoopTimer = null;
+  let humansPresent = false;
+  let supportPresent = false;
+  let firstNotificationSent = false;
+  let notificationInProgress = false;
+  let missingFileLogged = false;
 
-    let humansPresent = false;
-    let initialNotificationSent = false;
-    let supportWasPresent = false;
+  // ------------------------------------------------
+  // HELPERS
+  // ------------------------------------------------
 
-    let initialNotificationTimer = null;
-    let reminderTimer = null;
-    let missingFileWarningShown = false;
+  function getHumans(channel = voiceChannel) {
+    if (!channel?.members) return [];
 
-    // =============================================
-    // POMOCNICZE
-    // =============================================
+    return [...channel.members.values()].filter(
+      member => !member.user.bot
+    );
+  }
 
-    function getHumanMembers() {
-        if (!voiceChannel) return [];
+  function hasSupportMember(channel = voiceChannel) {
+    return getHumans(channel).some(member =>
+      [...SUPPORT_ROLE_IDS].some(roleId =>
+        member.roles.cache.has(roleId)
+      )
+    );
+  }
 
-        return [...voiceChannel.members.values()].filter(
-            member => !member.user.bot
+  async function refreshVoiceChannel() {
+    const channel = await client.channels.fetch(VOICE_CHANNEL_ID);
+
+    if (!channel || !channel.isVoiceBased()) {
+      throw new Error("The configured voice channel is unavailable.");
+    }
+
+    voiceChannel = channel;
+    return channel;
+  }
+
+  function clearNotificationTimer() {
+    if (notificationTimer) {
+      clearTimeout(notificationTimer);
+      notificationTimer = null;
+    }
+  }
+
+  function stopMusic() {
+    if (musicLoopTimer) {
+      clearTimeout(musicLoopTimer);
+      musicLoopTimer = null;
+    }
+
+    if (player.state.status !== AudioPlayerStatus.Idle) {
+      player.stop(true);
+    }
+  }
+
+  function leaveVoiceChannel() {
+    const oldConnection = connection;
+    connection = null;
+
+    if (
+      oldConnection &&
+      oldConnection.state.status !== VoiceConnectionStatus.Destroyed
+    ) {
+      oldConnection.destroy();
+      console.log("[WaitingRoom] Left the empty waiting room.");
+    }
+  }
+
+  // ------------------------------------------------
+  // MUSIC
+  // ------------------------------------------------
+
+  function playMusic() {
+    if (!humansPresent || !connection || !voiceChannel) return;
+
+    if (connection.state.status !== VoiceConnectionStatus.Ready) {
+      return;
+    }
+
+    if (player.state.status !== AudioPlayerStatus.Idle) {
+      return;
+    }
+
+    if (!fs.existsSync(MUSIC_FILE)) {
+      if (!missingFileLogged) {
+        console.error(
+          `[WaitingRoom] Audio file not found: ${MUSIC_FILE}`
         );
+        missingFileLogged = true;
+      }
+
+      return;
     }
 
-    function hasSupportMember() {
-        return getHumanMembers().some(member =>
-            member.roles.cache.some(role =>
-                SUPPORT_ROLE_IDS.has(role.id)
-            )
+    try {
+      player.play(
+        createAudioResource(MUSIC_FILE, {
+          metadata: { title: "Zexver Waiting Room" }
+        })
+      );
+
+      console.log("[WaitingRoom] Playing waiting-room audio.");
+    } catch (error) {
+      console.error(
+        "[WaitingRoom] Could not start audio:",
+        error.message
+      );
+    }
+  }
+
+  // Repeat the complete file, including the ElevenLabs announcement.
+  player.on(AudioPlayerStatus.Idle, () => {
+    if (
+      !humansPresent ||
+      !connection ||
+      connection.state.status !== VoiceConnectionStatus.Ready
+    ) {
+      return;
+    }
+
+    if (musicLoopTimer) clearTimeout(musicLoopTimer);
+
+    musicLoopTimer = setTimeout(() => {
+      musicLoopTimer = null;
+      playMusic();
+    }, 300);
+
+    musicLoopTimer.unref?.();
+  });
+
+  player.on("error", error => {
+    console.error(
+      "[WaitingRoom] Audio playback error:",
+      error.message
+    );
+  });
+
+  // ------------------------------------------------
+  // SUPPORT NOTIFICATIONS
+  // ------------------------------------------------
+
+  async function sendWaitingNotification() {
+    const channel = await refreshVoiceChannel();
+    const humans = getHumans(channel);
+
+    if (humans.length === 0 || hasSupportMember(channel)) {
+      return false;
+    }
+
+    const textChannel = await client.channels.fetch(
+      NOTIFICATION_CHANNEL_ID
+    );
+
+    if (
+      !textChannel ||
+      !textChannel.isTextBased() ||
+      typeof textChannel.send !== "function"
+    ) {
+      throw new Error("The notification text channel is unavailable.");
+    }
+
+    await textChannel.send({
+      content:
+        "🛎️ **Someone is waiting for help!**\n" +
+        `A user is waiting in <#${VOICE_CHANNEL_ID}>.\n` +
+        `<@&${NOTIFICATION_ROLE_ID}>`,
+
+      allowedMentions: {
+        parse: [],
+        roles: [NOTIFICATION_ROLE_ID],
+        users: []
+      }
+    });
+
+    console.log("[WaitingRoom] Sent a support notification.");
+    return true;
+  }
+
+  function scheduleNotification(delay) {
+    if (
+      notificationTimer ||
+      notificationInProgress ||
+      !humansPresent ||
+      supportPresent
+    ) {
+      return;
+    }
+
+    notificationTimer = setTimeout(async () => {
+      notificationTimer = null;
+      notificationInProgress = true;
+
+      try {
+        const sent = await sendWaitingNotification();
+
+        if (sent) {
+          firstNotificationSent = true;
+        }
+      } catch (error) {
+        console.error(
+          "[WaitingRoom] Notification failed:",
+          error.message
         );
+
+        // Retry later if Discord temporarily prevents sending.
+        scheduleNotification(NOTIFICATION_RETRY_DELAY);
+      } finally {
+        notificationInProgress = false;
+      }
+
+      await syncPresence();
+    }, delay);
+
+    notificationTimer.unref?.();
+  }
+
+  // ------------------------------------------------
+  // VOICE CONNECTION
+  // ------------------------------------------------
+
+  function scheduleReconnect() {
+    if (reconnectTimer || !humansPresent) return;
+
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      void syncPresence();
+    }, CONNECTION_RETRY_DELAY);
+
+    reconnectTimer.unref?.();
+  }
+
+  async function connectToChannel(channel) {
+    if (
+      connection &&
+      connection.state.status === VoiceConnectionStatus.Ready
+    ) {
+      playMusic();
+      return;
     }
 
-    function clearInitialNotificationTimer() {
-        if (initialNotificationTimer) {
-            clearTimeout(initialNotificationTimer);
-            initialNotificationTimer = null;
-        }
+    if (connectPromise) {
+      await connectPromise;
+      return;
     }
 
-    function clearReminderTimer() {
-        if (reminderTimer) {
-            clearTimeout(reminderTimer);
-            reminderTimer = null;
-        }
-    }
+    connectPromise = (async () => {
+      let newConnection;
 
-    function clearNotificationTimers() {
-        clearInitialNotificationTimer();
-        clearReminderTimer();
-    }
-
-    function stopMusic() {
-        if (musicLoopTimer) {
-            clearTimeout(musicLoopTimer);
-            musicLoopTimer = null;
-        }
-
-        if (player.state.status !== AudioPlayerStatus.Idle) {
-            player.stop(true);
-        }
-    }
-
-    // =============================================
-    // MUZYKA
-    // =============================================
-
-    function playMusic() {
+      try {
         if (!humansPresent) return;
 
-        if (
-            !connection ||
-            connection.state.status !== VoiceConnectionStatus.Ready
-        ) {
-            return;
-        }
-
-        if (player.state.status !== AudioPlayerStatus.Idle) {
-            return;
-        }
-
-        if (!fs.existsSync(MUSIC_FILE_PATH)) {
-            if (!missingFileWarningShown) {
-                console.error(
-                    `[WaitingRoom] Nie znaleziono pliku audio: ${MUSIC_FILE_PATH}`
-                );
-                missingFileWarningShown = true;
-            }
-
-            return;
-        }
-
-        try {
-            const resource = createAudioResource(MUSIC_FILE_PATH);
-            player.play(resource);
-
-            console.log("[WaitingRoom] Rozpoczęto odtwarzanie muzyki.");
-        } catch (error) {
-            console.error(
-                "[WaitingRoom] Nie udało się uruchomić muzyki:",
-                error
-            );
-        }
-    }
-
-    // Po zakończeniu pliku uruchom go ponownie,
-    // ale tylko wtedy, gdy ktoś nadal jest w poczekalni.
-    player.on(AudioPlayerStatus.Idle, () => {
-        if (!humansPresent || !fs.existsSync(MUSIC_FILE_PATH)) {
-            return;
-        }
-
-        if (musicLoopTimer) {
-            clearTimeout(musicLoopTimer);
-        }
-
-        musicLoopTimer = setTimeout(() => {
-            musicLoopTimer = null;
-
-            if (
-                humansPresent &&
-                getHumanMembers().length > 0 &&
-                player.state.status === AudioPlayerStatus.Idle
-            ) {
-                playMusic();
-            }
-        }, 300);
-
-        musicLoopTimer.unref?.();
-    });
-
-    player.on("error", error => {
-        console.error(
-            "[WaitingRoom] Błąd odtwarzacza audio:",
-            error
-        );
-    });
-
-    // =============================================
-    // POWIADOMIENIA O OCZEKUJĄCYCH
-    // =============================================
-
-    async function sendWaitingNotification() {
-        try {
-            const updatedVoiceChannel = await client.channels.fetch(
-                WAITING_VOICE_CHANNEL_ID
-            );
-
-            if (
-                !updatedVoiceChannel ||
-                !updatedVoiceChannel.isVoiceBased()
-            ) {
-                console.error(
-                    "[WaitingRoom] Nie znaleziono kanału głosowego."
-                );
-                return false;
-            }
-
-            voiceChannel = updatedVoiceChannel;
-
-            // Nie wysyłaj niczego, jeśli kanał jest pusty.
-            if (getHumanMembers().length === 0) {
-                return false;
-            }
-
-            // Jeśli osoba uprawniona już pomaga, nie pinguj zespołu.
-            if (hasSupportMember()) {
-                return false;
-            }
-
-            const textChannel = await client.channels.fetch(
-                NOTIFICATION_TEXT_CHANNEL_ID
-            );
-
-            if (
-                !textChannel ||
-                !textChannel.isTextBased() ||
-                typeof textChannel.send !== "function"
-            ) {
-                console.error(
-                    "[WaitingRoom] Nie znaleziono kanału tekstowego."
-                );
-                return false;
-            }
-
-            await textChannel.send({
-                content:
-                    "🛎️ **Someone is waiting for help!** " +
-                    `A user is waiting in <#${WAITING_VOICE_CHANNEL_ID}>. ` +
-                    `<@&${NOTIFICATION_ROLE_ID}>`,
-
-                // Dozwolony jest tylko ping wskazanej roli.
-                allowedMentions: {
-                    parse: [],
-                    roles: [NOTIFICATION_ROLE_ID],
-                    users: []
-                }
-            });
-
-            console.log(
-                "[WaitingRoom] Wysłano powiadomienie o oczekującej osobie."
-            );
-
-            return true;
-        } catch (error) {
-            console.error(
-                "[WaitingRoom] Nie udało się wysłać powiadomienia:",
-                error
-            );
-
-            return false;
-        }
-    }
-
-    function scheduleInitialNotification() {
-        if (
-            initialNotificationTimer ||
-            initialNotificationSent ||
-            !humansPresent ||
-            getHumanMembers().length === 0 ||
-            hasSupportMember()
-        ) {
-            return;
-        }
-
-        initialNotificationTimer = setTimeout(async () => {
-            initialNotificationTimer = null;
-
-            const sent = await sendWaitingNotification();
-
-            if (sent) {
-                initialNotificationSent = true;
-                scheduleReminder();
-            } else {
-                await syncPresence();
-            }
-        }, FIRST_NOTIFICATION_DELAY);
-
-        initialNotificationTimer.unref?.();
-    }
-
-    function scheduleReminder() {
-        if (
-            reminderTimer ||
-            !humansPresent ||
-            !initialNotificationSent ||
-            getHumanMembers().length === 0 ||
-            hasSupportMember()
-        ) {
-            return;
-        }
-
-        reminderTimer = setTimeout(async () => {
-            reminderTimer = null;
-
-            const sent = await sendWaitingNotification();
-
-            if (sent) {
-                // Następne przypomnienie za 5 minut,
-                // jeżeli nadal nikt z obsługi nie dołączył.
-                scheduleReminder();
-            } else {
-                await syncPresence();
-            }
-        }, REMINDER_INTERVAL);
-
-        reminderTimer.unref?.();
-    }
-
-    // =============================================
-    // SPRAWDZANIE OBECNOŚCI NA POCZEKALNI
-    // =============================================
-
-    async function syncPresence() {
-        try {
-            const updatedVoiceChannel = await client.channels.fetch(
-                WAITING_VOICE_CHANNEL_ID
-            );
-
-            if (
-                !updatedVoiceChannel ||
-                !updatedVoiceChannel.isVoiceBased()
-            ) {
-                console.error(
-                    "[WaitingRoom] Kanał głosowy jest niedostępny."
-                );
-                return;
-            }
-
-            voiceChannel = updatedVoiceChannel;
-
-            const humans = getHumanMembers();
-
-            // Kanał pusty: zatrzymaj muzykę i wyzeruj oczekiwanie.
-            if (humans.length === 0) {
-                humansPresent = false;
-                initialNotificationSent = false;
-                supportWasPresent = false;
-
-                clearNotificationTimers();
-                stopMusic();
-
-                return;
-            }
-
-            humansPresent = true;
-
-            // Jeśli bot jest już połączony, uruchom muzykę.
-            playMusic();
-
-            const supportPresent = hasSupportMember();
-
-            if (supportPresent) {
-                // Osoba z odpowiednią rolą jest na kanale:
-                // zatrzymaj nowe powiadomienia.
-                clearNotificationTimers();
-                supportWasPresent = true;
-
-                return;
-            }
-
-            if (supportWasPresent) {
-                // Obsługa opuściła kanał, ale ktoś nadal czeka.
-                supportWasPresent = false;
-
-                if (initialNotificationSent) {
-                    scheduleReminder();
-                } else {
-                    scheduleInitialNotification();
-                }
-
-                return;
-            }
-
-            if (!initialNotificationSent) {
-                // Pierwszy ping po 10 sekundach oczekiwania.
-                scheduleInitialNotification();
-            } else {
-                // Kolejne pingi co 5 minut.
-                scheduleReminder();
-            }
-        } catch (error) {
-            console.error(
-                "[WaitingRoom] Błąd sprawdzania poczekalni:",
-                error
-            );
-        }
-    }
-
-    // =============================================
-    // POŁĄCZENIE GŁOSOWE I PONOWNE ŁĄCZENIE
-    // =============================================
-
-    function scheduleReconnect() {
-        if (reconnectTimer) return;
-
-        reconnectTimer = setTimeout(() => {
-            reconnectTimer = null;
-            void connectToWaitingRoom();
-        }, RECONNECT_DELAY);
-
-        reconnectTimer.unref?.();
-    }
-
-    async function recoverConnection(disconnectedConnection) {
-        if (recovering) return;
-
-        recovering = true;
-
-        try {
-            await Promise.race([
-                entersState(
-                    disconnectedConnection,
-                    VoiceConnectionStatus.Signalling,
-                    5_000
-                ),
-                entersState(
-                    disconnectedConnection,
-                    VoiceConnectionStatus.Connecting,
-                    5_000
-                )
-            ]);
-        } catch {
-            if (connection === disconnectedConnection) {
-                try {
-                    disconnectedConnection.destroy();
-                } catch {
-                    // Połączenie mogło już zostać zamknięte.
-                }
-
-                connection = null;
-                scheduleReconnect();
-            }
-        } finally {
-            recovering = false;
-        }
-    }
-
-    async function connectToWaitingRoom() {
-        if (connecting) return;
-
-        connecting = true;
-
-        try {
-            const channel = await client.channels.fetch(
-                WAITING_VOICE_CHANNEL_ID
-            );
-
-            if (!channel || !channel.isVoiceBased()) {
-                console.error(
-                    "[WaitingRoom] Podane ID nie wskazuje kanału głosowego."
-                );
-                return;
-            }
-
-            voiceChannel = channel;
-
-            const newConnection = joinVoiceChannel({
-                channelId: channel.id,
-                guildId: channel.guild.id,
-                adapterCreator: channel.guild.voiceAdapterCreator,
-
-                // Bot pozostaje połączony również wtedy,
-                // gdy aktualnie nic nie odtwarza.
-                selfDeaf: true
-            });
-
-            connection = newConnection;
-            newConnection.subscribe(player);
-
-            newConnection.on("error", error => {
-                console.error(
-                    "[WaitingRoom] Błąd połączenia głosowego:",
-                    error
-                );
-            });
-
-            newConnection.on("stateChange", (oldState, newState) => {
-                if (newState.status === VoiceConnectionStatus.Ready) {
-                    void syncPresence();
-                }
-
-                if (
-                    newState.status === VoiceConnectionStatus.Disconnected
-                ) {
-                    void recoverConnection(newConnection);
-                }
-            });
-
-            await entersState(
-                newConnection,
-                VoiceConnectionStatus.Ready,
-                30_000
-            );
-
-            console.log(
-                "[WaitingRoom] Bot połączony z kanałem poczekalni."
-            );
-
-            await syncPresence();
-        } catch (error) {
-            console.error(
-                "[WaitingRoom] Nie udało się połączyć z poczekalnią:",
-                error
-            );
-
-            if (
-                connection &&
-                connection.state.status !== VoiceConnectionStatus.Destroyed
-            ) {
-                try {
-                    connection.destroy();
-                } catch {
-                    // Połączenie mogło być już zamknięte.
-                }
-            }
-
+        newConnection = joinVoiceChannel({
+          channelId: channel.id,
+          guildId: channel.guild.id,
+          adapterCreator: channel.guild.voiceAdapterCreator,
+          selfDeaf: true
+        });
+
+        connection = newConnection;
+        newConnection.subscribe(player);
+
+        newConnection.on("error", error => {
+          console.error(
+            "[WaitingRoom] Voice connection error:",
+            error.message
+          );
+        });
+
+        newConnection.on("stateChange", (_oldState, newState) => {
+          if (newState.status === VoiceConnectionStatus.Ready) {
+            console.log("[WaitingRoom] Voice connection is ready.");
+
+            if (humansPresent) playMusic();
+          }
+
+          if (
+            newState.status === VoiceConnectionStatus.Destroyed &&
+            connection === newConnection &&
+            humansPresent
+          ) {
             connection = null;
             scheduleReconnect();
-        } finally {
-            connecting = false;
+          }
+        });
+
+        await entersState(
+          newConnection,
+          VoiceConnectionStatus.Ready,
+          30_000
+        );
+
+        // Someone may have left while the connection was starting.
+        if (!humansPresent) {
+          if (connection === newConnection) {
+            leaveVoiceChannel();
+          }
+
+          return;
         }
+
+        console.log("[WaitingRoom] Joined the waiting room.");
+        playMusic();
+      } catch (error) {
+        console.error(
+          "[WaitingRoom] Could not join voice:",
+          error.message
+        );
+
+        if (connection === newConnection) {
+          connection = null;
+        }
+
+        if (
+          newConnection &&
+          newConnection.state.status !== VoiceConnectionStatus.Destroyed
+        ) {
+          newConnection.destroy();
+        }
+
+        if (humansPresent) scheduleReconnect();
+      }
+    })();
+
+    try {
+      await connectPromise;
+    } finally {
+      connectPromise = null;
+    }
+  }
+
+  // ------------------------------------------------
+  // PRESENCE AND WAITING TIMER
+  // ------------------------------------------------
+
+  async function syncPresence() {
+    let channel;
+
+    try {
+      channel = await refreshVoiceChannel();
+    } catch (error) {
+      console.error(
+        "[WaitingRoom] Could not check waiting room:",
+        error.message
+      );
+      return;
     }
 
-    // =============================================
-    // EVENTY DISCORDA
-    // =============================================
+    const humans = getHumans(channel);
 
-    client.on("voiceStateUpdate", (oldState, newState) => {
-        if (
-            oldState.channelId === WAITING_VOICE_CHANNEL_ID ||
-            newState.channelId === WAITING_VOICE_CHANNEL_ID
-        ) {
-            void syncPresence();
-        }
-    });
+    // No people: cancel timers, stop audio, and disconnect.
+    if (humans.length === 0) {
+      humansPresent = false;
+      supportPresent = false;
+      firstNotificationSent = false;
 
-    // Gdy komuś zmieni się rola podczas oczekiwania,
-    // od razu ponownie sprawdź, czy jest już obsługa.
-    client.on("guildMemberUpdate", (oldMember, newMember) => {
-        const wasSupport = oldMember.roles.cache.some(role =>
-            SUPPORT_ROLE_IDS.has(role.id)
-        );
+      clearNotificationTimer();
 
-        const isSupport = newMember.roles.cache.some(role =>
-            SUPPORT_ROLE_IDS.has(role.id)
-        );
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
 
-        if (
-            wasSupport !== isSupport &&
-            newMember.voice.channelId === WAITING_VOICE_CHANNEL_ID
-        ) {
-            void syncPresence();
-        }
-    });
+      stopMusic();
+      leaveVoiceChannel();
+      return;
+    }
 
-    client.once("clientReady", () => {
-        console.log("[WaitingRoom] Uruchamianie modułu poczekalni...");
-        void connectToWaitingRoom();
-    });
+    humansPresent = true;
+
+    const supportIsHere = hasSupportMember(channel);
+    supportPresent = supportIsHere;
+
+    if (supportIsHere) {
+      // Don't notify while an authorised support member is present.
+      clearNotificationTimer();
+    } else {
+      const delay = firstNotificationSent
+        ? REMINDER_INTERVAL
+        : FIRST_NOTIFICATION_DELAY;
+
+      scheduleNotification(delay);
+    }
+
+    // Connect only after a human has entered the channel.
+    await connectToChannel(channel);
+  }
+
+  // ------------------------------------------------
+  // DISCORD EVENTS
+  // ------------------------------------------------
+
+  client.on("voiceStateUpdate", (oldState, newState) => {
+    if (
+      oldState.channelId === VOICE_CHANNEL_ID ||
+      newState.channelId === VOICE_CHANNEL_ID
+    ) {
+      void syncPresence();
+    }
+  });
+
+  client.on("guildMemberUpdate", (oldMember, newMember) => {
+    const wasSupport = [...SUPPORT_ROLE_IDS].some(roleId =>
+      oldMember.roles.cache.has(roleId)
+    );
+
+    const isSupport = [...SUPPORT_ROLE_IDS].some(roleId =>
+      newMember.roles.cache.has(roleId)
+    );
+
+    if (
+      wasSupport !== isSupport &&
+      newMember.voice.channelId === VOICE_CHANNEL_ID
+    ) {
+      void syncPresence();
+    }
+  });
+
+  client.once("clientReady", () => {
+    console.log("[WaitingRoom] Waiting for the first visitor.");
+    void syncPresence();
+  });
 };
