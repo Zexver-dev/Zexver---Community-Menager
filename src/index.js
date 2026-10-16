@@ -41,6 +41,8 @@ const GIVEAWAY_ROLES = [
   "1559582256731922562"
 ];
 
+const ANNOUNCE_ROLES = GIVEAWAY_ROLES;
+
 const DAILY_REWARD = [20000, 10000, 5000, 2000, 2000];
 const KEEP_COOLDOWN = 5 * 60 * 60 * 1000;
 const QUIZ_INTERVAL = 2 * 60 * 60 * 1000;
@@ -156,7 +158,11 @@ const commands = [
         .setMinValue(1)
         .setMaxValue(25)
         .setRequired(true)
-    )
+    ),
+
+  new SlashCommandBuilder()
+    .setName("announce")
+    .setDescription("Create and publish a community announcement.")
 ].map(command => command.toJSON());
 
 const rest = new REST({ version: "10" }).setToken(TOKEN);
@@ -171,6 +177,23 @@ function makeEmbed(title, description) {
     .setTitle(title)
     .setDescription(description)
     .setTimestamp();
+}
+
+async function hasAllowedRole(interaction, allowedRoles) {
+  if (!interaction.guild) return false;
+
+  try {
+    const member = await interaction.guild.members.fetch(
+      interaction.user.id
+    );
+
+    return allowedRoles.some(roleId =>
+      member.roles.cache.has(roleId)
+    );
+  } catch (error) {
+    console.error("Could not verify member roles:", error.message);
+    return false;
+  }
 }
 
 function parseDuration(input) {
@@ -244,6 +267,95 @@ function getDailyScore(userId) {
   }
 
   return state.dailyScores[userId];
+}
+
+// --------------------------------------------------
+// ANNOUNCE
+// --------------------------------------------------
+
+function createAnnouncementModal(channelId) {
+  const modal = new ModalBuilder()
+    .setCustomId(`announce_submit:${channelId}`)
+    .setTitle("Create an Announcement");
+
+  const titleInput = new TextInputBuilder()
+    .setCustomId("announcement_title")
+    .setLabel("Title")
+    .setPlaceholder("Enter the announcement title")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMaxLength(256);
+
+  const descriptionInput = new TextInputBuilder()
+    .setCustomId("announcement_description")
+    .setLabel("Description")
+    .setPlaceholder("Write your announcement here")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMaxLength(4000);
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(titleInput),
+    new ActionRowBuilder().addComponents(descriptionInput)
+  );
+
+  return modal;
+}
+
+async function publishAnnouncement(interaction, channelId) {
+  const title = interaction.fields
+    .getTextInputValue("announcement_title")
+    .trim();
+
+  const description = interaction.fields
+    .getTextInputValue("announcement_description")
+    .trim();
+
+  if (!title || !description) {
+    return interaction.reply({
+      content: "Both the title and description are required.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  const channel = await getTextChannel(channelId);
+
+  if (!channel || channel.guildId !== interaction.guildId) {
+    return interaction.reply({
+      content: "I could not access the announcement channel.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  const botMember = interaction.guild.members.me;
+
+  if (
+    !botMember ||
+    !channel.permissionsFor(botMember)?.has(["ViewChannel", "SendMessages", "EmbedLinks"])
+  ) {
+    return interaction.reply({
+      content: "I need permission to view this channel, send messages, and embed links.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  try {
+    await channel.send({
+      embeds: [makeEmbed(title, description)]
+    });
+
+    return interaction.reply({
+      content: `Announcement published successfully in <#${channelId}>.`,
+      flags: MessageFlags.Ephemeral
+    });
+  } catch (error) {
+    console.error("Could not publish announcement:", error);
+
+    return interaction.reply({
+      content: "The announcement could not be published. Please check my channel permissions.",
+      flags: MessageFlags.Ephemeral
+    });
+  }
 }
 
 // --------------------------------------------------
@@ -468,7 +580,7 @@ async function postQuiz() {
         [
           `**Question:** ${question.question}`,
           "",
-          `You have 90 minutes to submit your answer.`,
+          "You have 90 minutes to submit your answer.",
           `Answers close ${discordTime(now + QUIZ_DURATION)}.`,
           "",
           "Click the button below to submit your answer. Each participant gets one attempt."
@@ -514,9 +626,7 @@ async function closeQuiz() {
     }
 
     await channel.send({
-      embeds: [
-        makeEmbed("Quizzy — Results", description)
-      ]
+      embeds: [makeEmbed("Quizzy — Results", description)]
     });
 
     if (quiz.messageId) {
@@ -579,10 +689,7 @@ async function postDailyLeaderboard() {
 
     await channel.send({
       embeds: [
-        makeEmbed(
-          "Quizzy — Daily Leaderboard",
-          description
-        )
+        makeEmbed("Quizzy — Daily Leaderboard", description)
       ]
     });
 
@@ -718,12 +825,38 @@ async function schedulerTick() {
 client.on("interactionCreate", async interaction => {
   try {
     if (interaction.isChatInputCommand()) {
-      if (interaction.commandName === "giveavay") {
-        const member = interaction.member;
-        const roles = member?.roles?.cache;
+      // ANNOUNCE COMMAND
+      if (interaction.commandName === "announce") {
+        const permitted = await hasAllowedRole(
+          interaction,
+          ANNOUNCE_ROLES
+        );
 
-        const permitted = roles &&
-          GIVEAWAY_ROLES.some(roleId => roles.has(roleId));
+        if (!permitted) {
+          return interaction.reply({
+            content: "You do not have permission to create announcements.",
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        if (!interaction.channelId) {
+          return interaction.reply({
+            content: "Please use this command in a server text channel.",
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        return interaction.showModal(
+          createAnnouncementModal(interaction.channelId)
+        );
+      }
+
+      // GIVEAWAY COMMAND
+      if (interaction.commandName === "giveavay") {
+        const permitted = await hasAllowedRole(
+          interaction,
+          GIVEAWAY_ROLES
+        );
 
         if (!permitted) {
           return interaction.reply({
@@ -803,6 +936,7 @@ client.on("interactionCreate", async interaction => {
       }
     }
 
+    // BUTTONS
     if (interaction.isButton()) {
       if (interaction.customId === "keep_alive") {
         const userId = interaction.user.id;
@@ -933,52 +1067,73 @@ client.on("interactionCreate", async interaction => {
       }
     }
 
-    if (interaction.isModalSubmit() && interaction.customId === "quiz_submit") {
-      const quiz = state.activeQuiz;
+    // MODAL SUBMISSIONS
+    if (interaction.isModalSubmit()) {
+      if (interaction.customId.startsWith("announce_submit:")) {
+        const permitted = await hasAllowedRole(
+          interaction,
+          ANNOUNCE_ROLES
+        );
 
-      if (!quiz || Date.now() >= quiz.endsAt) {
+        if (!permitted) {
+          return interaction.reply({
+            content: "You do not have permission to create announcements.",
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        const channelId = interaction.customId.split(":")[1];
+
+        return publishAnnouncement(interaction, channelId);
+      }
+
+      if (interaction.customId === "quiz_submit") {
+        const quiz = state.activeQuiz;
+
+        if (!quiz || Date.now() >= quiz.endsAt) {
+          return interaction.reply({
+            content: "This quiz is closed. Your answer was not recorded.",
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        if (quiz.answers[interaction.user.id]) {
+          return interaction.reply({
+            content: "You have already submitted an answer for this quiz.",
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        const question = questions[quiz.questionIndex];
+        const answer = interaction.fields.getTextInputValue("answer");
+        const elapsedMs = Math.max(0, Date.now() - quiz.startedAt);
+        const correct = isCorrect(question, answer);
+        const points = correct ? 100 + answerBonus(elapsedMs) : 0;
+
+        quiz.answers[interaction.user.id] = {
+          points,
+          correct,
+          elapsedMs,
+          answeredAt: Date.now()
+        };
+
+        if (correct) {
+          const score = getDailyScore(interaction.user.id);
+
+          score.points += points;
+          score.correct += 1;
+          score.totalTimeMs += elapsedMs;
+        }
+
+        saveState();
+
         return interaction.reply({
-          content: "This quiz is closed. Your answer was not recorded.",
+          content: correct
+            ? `Correct answer! You earned ${points} points.`
+            : "Incorrect answer. You earned 0 points. Better luck next time!",
           flags: MessageFlags.Ephemeral
         });
       }
-
-      if (quiz.answers[interaction.user.id]) {
-        return interaction.reply({
-          content: "You have already submitted an answer for this quiz.",
-          flags: MessageFlags.Ephemeral
-        });
-      }
-
-      const question = questions[quiz.questionIndex];
-      const answer = interaction.fields.getTextInputValue("answer");
-      const elapsedMs = Math.max(0, Date.now() - quiz.startedAt);
-      const correct = isCorrect(question, answer);
-      const points = correct ? 100 + answerBonus(elapsedMs) : 0;
-
-      quiz.answers[interaction.user.id] = {
-        points,
-        correct,
-        elapsedMs,
-        answeredAt: Date.now()
-      };
-
-      if (correct) {
-        const score = getDailyScore(interaction.user.id);
-
-        score.points += points;
-        score.correct += 1;
-        score.totalTimeMs += elapsedMs;
-      }
-
-      saveState();
-
-      return interaction.reply({
-        content: correct
-          ? `Correct answer! You earned ${points} points.`
-          : "Incorrect answer. You earned 0 points. Better luck next time!",
-        flags: MessageFlags.Ephemeral
-      });
     }
   } catch (error) {
     console.error("Interaction error:", error);
