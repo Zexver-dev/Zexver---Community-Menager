@@ -1,3 +1,4 @@
+
 const {
   Client,
   GatewayIntentBits,
@@ -12,7 +13,11 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  MessageFlags
+  MessageFlags,
+  ChannelType,
+  PermissionFlagsBits,
+  StringSelectMenuBuilder,
+  AttachmentBuilder
 } = require("discord.js");
 
 const fs = require("node:fs");
@@ -48,6 +53,52 @@ const QUIZ_INTERVAL = 2 * 60 * 60 * 1000;
 const QUIZ_DURATION = 90 * 60 * 1000;
 const DAY = 24 * 60 * 60 * 1000;
 
+// Ticket configuration
+const TICKET_PANEL_CHANNEL_ID = "1560338921173553203";
+const TICKET_TRANSCRIPT_CHANNEL_ID = "1561036169649848470";
+
+const TICKET_STAFF_ROLE_IDS = [
+  "1559581706929840198",
+  "1559581789306228736",
+  "1559581840908484608",
+  "1559581895531044945",
+  "1559581952103813270",
+  "1559582187869704233",
+  "1559582256731922562",
+  "1559582345907142857"
+];
+
+const TICKET_EXTRA_STAFF_ROLE_ID = "1559585704177049600";
+
+const MAX_OPEN_TICKETS = 3;
+const TICKET_REMINDER_DELAY = 10 * 60 * 1000;
+const TICKET_DELETE_DELAY = 5 * 1000;
+
+const TICKET_CATEGORIES = {
+  general_support: {
+    label: "General Support",
+    description: "Get help with a question or problem.",
+    emoji: "🛟"
+  },
+  customer_service: {
+    label: "Customer Service",
+    description: "Get help with a service-related issue.",
+    emoji: "💬"
+  },
+  business_inquiry: {
+    label: "Business Inquiry",
+    description: "Discuss a business-related matter.",
+    emoji: "💼"
+  },
+  partnership_proposition: {
+    label: "Partnership Proposition",
+    description: "Propose a partnership with us.",
+    emoji: "🤝"
+  }
+};
+
+const TICKET_PRIORITIES = ["Low", "Standard", "High"];
+
 if (!TOKEN || !CLIENT_ID || !GUILD_ID) {
   console.error(
     "Missing environment variables: DISCORD_TOKEN, CLIENT_ID, GUILD_ID."
@@ -61,6 +112,7 @@ if (!TOKEN || !CLIENT_ID || !GUILD_ID) {
 
 const DATA_DIR = path.join(__dirname, "..", "data");
 const DATA_FILE = path.join(DATA_DIR, "state.json");
+const TICKETS_FILE = path.join(DATA_DIR, "tickets.json");
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -101,6 +153,46 @@ function saveState() {
   fs.renameSync(temporaryFile, DATA_FILE);
 }
 
+// Ticket state is stored separately from the existing bot data.
+let ticketState = {
+  panelMessageId: null,
+  tickets: {}
+};
+
+try {
+  if (fs.existsSync(TICKETS_FILE)) {
+    const saved = JSON.parse(
+      fs.readFileSync(TICKETS_FILE, "utf8")
+    );
+
+    ticketState = {
+      panelMessageId: saved.panelMessageId || null,
+      tickets:
+        saved.tickets && typeof saved.tickets === "object"
+          ? saved.tickets
+          : {}
+    };
+  }
+} catch (error) {
+  console.error("Could not read ticket data:", error);
+}
+
+function saveTickets() {
+  const temporaryFile = `${TICKETS_FILE}.tmp`;
+
+  try {
+    fs.writeFileSync(
+      temporaryFile,
+      JSON.stringify(ticketState, null, 2),
+      "utf8"
+    );
+
+    fs.renameSync(temporaryFile, TICKETS_FILE);
+  } catch (error) {
+    console.error("Could not save ticket data:", error);
+  }
+}
+
 // --------------------------------------------------
 // DISCORD CLIENT
 // --------------------------------------------------
@@ -109,13 +201,13 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildVoiceStates
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages
   ],
   partials: [Partials.Channel]
 });
 
-// Connect the waiting-room music and support notification module.
-// The module must exist at src/waitingRoom.js.
+// Existing waiting-room module.
 require("./waitingRoom")(client);
 
 // --------------------------------------------------
@@ -282,6 +374,800 @@ function getDailyScore(userId) {
 }
 
 // --------------------------------------------------
+// TICKET HELPERS
+// --------------------------------------------------
+
+function getTicket(channelId) {
+  return ticketState.tickets[channelId] || null;
+}
+
+function getOpenTicketsForUser(userId) {
+  return Object.values(ticketState.tickets).filter(
+    ticket =>
+      ticket.userId === userId &&
+      !ticket.closed
+  );
+}
+
+function isTicketStaff(member, categoryKey) {
+  if (!member?.roles?.cache) return false;
+
+  const hasMainStaffRole = TICKET_STAFF_ROLE_IDS.some(
+    roleId => member.roles.cache.has(roleId)
+  );
+
+  if (categoryKey === "partnership_proposition") {
+    return hasMainStaffRole;
+  }
+
+  return (
+    hasMainStaffRole ||
+    member.roles.cache.has(TICKET_EXTRA_STAFF_ROLE_ID)
+  );
+}
+
+function createTicketPanelEmbed() {
+  return new EmbedBuilder()
+    .setColor(0xf28c28)
+    .setTitle("ZexverAI Support Center")
+    .setDescription([
+      "Welcome to the ZexverAI Support Center.",
+      "",
+      "Select the category that best matches your request to create a private ticket.",
+      "",
+      "**Available categories**",
+      "🛟 General Support",
+      "💬 Customer Service",
+      "💼 Business Inquiry",
+      "🤝 Partnership Proposition",
+      "",
+      "You can have up to 3 open tickets at a time.",
+      "",
+      "Please explain your request clearly after creating your ticket."
+    ].join("\n"))
+    .setFooter({ text: "ZexverAI Support System" });
+}
+
+function createTicketPanelComponents() {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("ticket_category_select")
+    .setPlaceholder("Select a ticket category...")
+    .setMinValues(1)
+    .setMaxValues(1)
+    .addOptions(
+      Object.entries(TICKET_CATEGORIES).map(
+        ([value, category]) => ({
+          label: category.label,
+          description: category.description,
+          value,
+          emoji: category.emoji
+        })
+      )
+    );
+
+  return [
+    new ActionRowBuilder().addComponents(menu)
+  ];
+}
+
+function createTicketEmbed(ticket) {
+  const category = TICKET_CATEGORIES[ticket.categoryKey];
+
+  return new EmbedBuilder()
+    .setColor(0xf28c28)
+    .setTitle("Support Ticket")
+    .setDescription([
+      `**Ticket ID:** \`${ticket.channelId}\``,
+      `**Category:** ${category?.label || ticket.categoryKey}`,
+      `**Created By:** <@${ticket.userId}>`,
+      `**Priority:** ${ticket.priority}`,
+      `**Claimed By:** ${
+        ticket.claimedBy
+          ? `<@${ticket.claimedBy}>`
+          : "Not claimed"
+      }`,
+      "",
+      "Please describe your request in this channel.",
+      "An authorized staff member will respond as soon as possible."
+    ].join("\n"))
+    .setTimestamp(new Date(ticket.createdAt))
+    .setFooter({ text: "ZexverAI Ticket System" });
+}
+
+function createTicketControls(ticket) {
+  const claimButton = new ButtonBuilder()
+    .setCustomId(`ticket_claim:${ticket.channelId}`)
+    .setLabel(ticket.claimedBy ? "Ticket Claimed" : "Claim")
+    .setStyle(
+      ticket.claimedBy
+        ? ButtonStyle.Secondary
+        : ButtonStyle.Success
+    )
+    .setDisabled(Boolean(ticket.claimedBy));
+
+  const closeButton = new ButtonBuilder()
+    .setCustomId(`ticket_close:${ticket.channelId}`)
+    .setLabel("Close")
+    .setStyle(ButtonStyle.Danger);
+
+  const priorityMenu = new StringSelectMenuBuilder()
+    .setCustomId(`ticket_priority:${ticket.channelId}`)
+    .setPlaceholder(`Priority: ${ticket.priority}`)
+    .setMinValues(1)
+    .setMaxValues(1)
+    .addOptions(
+      TICKET_PRIORITIES.map(priority => ({
+        label: priority,
+        value: priority.toLowerCase(),
+        default:
+          ticket.priority.toLowerCase() === priority.toLowerCase()
+      }))
+    );
+
+  return [
+    new ActionRowBuilder().addComponents(
+      claimButton,
+      closeButton
+    ),
+    new ActionRowBuilder().addComponents(priorityMenu)
+  ];
+}
+
+function ticketStaffOverwrites(categoryKey) {
+  const overwrites = TICKET_STAFF_ROLE_IDS.map(roleId => ({
+    id: roleId,
+    allow: [
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.ReadMessageHistory,
+      PermissionFlagsBits.AttachFiles,
+      PermissionFlagsBits.EmbedLinks
+    ]
+  }));
+
+  if (categoryKey !== "partnership_proposition") {
+    overwrites.push({
+      id: TICKET_EXTRA_STAFF_ROLE_ID,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.AttachFiles,
+        PermissionFlagsBits.EmbedLinks
+      ]
+    });
+  }
+
+  return overwrites;
+}
+
+async function ticketEphemeral(interaction, content) {
+  if (interaction.deferred || interaction.replied) {
+    return interaction.followUp({
+      content,
+      flags: MessageFlags.Ephemeral
+    });
+  }
+
+  return interaction.reply({
+    content,
+    flags: MessageFlags.Ephemeral
+  });
+}
+
+// --------------------------------------------------
+// TICKET PANEL SETUP
+// --------------------------------------------------
+
+async function setupTicketPanel() {
+  const channel = await getTextChannel(
+    TICKET_PANEL_CHANNEL_ID
+  );
+
+  if (!channel) {
+    console.error(
+      "Ticket panel channel is unavailable. Check TICKET_PANEL_CHANNEL_ID."
+    );
+    return;
+  }
+
+  let existingMessage = null;
+
+  if (ticketState.panelMessageId) {
+    existingMessage = await channel.messages
+      .fetch(ticketState.panelMessageId)
+      .catch(() => null);
+  }
+
+  const payload = {
+    embeds: [createTicketPanelEmbed()],
+    components: createTicketPanelComponents()
+  };
+
+  if (existingMessage) {
+    await existingMessage.edit(payload);
+  } else {
+    const message = await channel.send(payload);
+    ticketState.panelMessageId = message.id;
+    saveTickets();
+  }
+
+  console.log("Ticket panel is ready.");
+}
+
+// --------------------------------------------------
+// CREATE TICKET
+// --------------------------------------------------
+
+async function createTicket(interaction, categoryKey) {
+  const category = TICKET_CATEGORIES[categoryKey];
+
+  if (!category) {
+    return ticketEphemeral(
+      interaction,
+      "That ticket category is invalid."
+    );
+  }
+
+  if (!interaction.guild) {
+    return ticketEphemeral(
+      interaction,
+      "Tickets can only be created inside a server."
+    );
+  }
+
+  const openTickets = getOpenTicketsForUser(
+    interaction.user.id
+  );
+
+  if (openTickets.length >= MAX_OPEN_TICKETS) {
+    return ticketEphemeral(
+      interaction,
+      "You already have 3 open tickets. Close an existing ticket before creating another one."
+    );
+  }
+
+  await interaction.deferReply({
+    flags: MessageFlags.Ephemeral
+  });
+
+  const safeUsername = interaction.user.username
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 35) || "user";
+
+  const channelName = `ticket-${safeUsername}`.slice(0, 90);
+
+  const permissionOverwrites = [
+    {
+      id: interaction.guild.roles.everyone.id,
+      deny: [PermissionFlagsBits.ViewChannel]
+    },
+    {
+      id: interaction.user.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.AttachFiles,
+        PermissionFlagsBits.EmbedLinks
+      ]
+    },
+    {
+      id: client.user.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.ManageChannels,
+        PermissionFlagsBits.AttachFiles,
+        PermissionFlagsBits.EmbedLinks
+      ]
+    },
+    ...ticketStaffOverwrites(categoryKey)
+  ];
+
+  let ticketChannel;
+
+  try {
+    ticketChannel = await interaction.guild.channels.create({
+      name: channelName,
+      type: ChannelType.GuildText,
+      topic: `ZexverAI ticket | User: ${interaction.user.id} | Category: ${category.label}`,
+      permissionOverwrites,
+      reason: `Support ticket created by ${interaction.user.tag}`
+    });
+  } catch (error) {
+    console.error("Could not create ticket channel:", error);
+
+    return interaction.editReply({
+      content:
+        "I couldn't create your ticket. Please check the bot's Manage Channels permission."
+    });
+  }
+
+  const ticket = {
+    channelId: ticketChannel.id,
+    guildId: interaction.guild.id,
+    userId: interaction.user.id,
+    username: interaction.user.tag,
+    categoryKey,
+    priority: "Standard",
+    claimedBy: null,
+    claimedByTag: null,
+    createdAt: Date.now(),
+    closed: false,
+    reminderSent: false,
+    staffResponded: false
+  };
+
+  ticketState.tickets[ticketChannel.id] = ticket;
+  saveTickets();
+
+  try {
+    await ticketChannel.send({
+      content: `<@${interaction.user.id}>`,
+      embeds: [createTicketEmbed(ticket)],
+      components: createTicketControls(ticket),
+      allowedMentions: {
+        users: [interaction.user.id]
+      }
+    });
+  } catch (error) {
+    console.error("Could not post ticket controls:", error);
+  }
+
+  await interaction.editReply({
+    content: `Your ticket has been created successfully: ${ticketChannel}`
+  });
+
+  console.log(
+    `Created ticket ${ticketChannel.id} for ${interaction.user.tag}`
+  );
+}
+
+// --------------------------------------------------
+// CLAIM TICKET
+// --------------------------------------------------
+
+async function claimTicket(interaction, channelId) {
+  const ticket = getTicket(channelId);
+
+  if (!ticket || ticket.closed) {
+    return ticketEphemeral(
+      interaction,
+      "This ticket is no longer open."
+    );
+  }
+
+  if (!isTicketStaff(interaction.member, ticket.categoryKey)) {
+    return ticketEphemeral(
+      interaction,
+      "You do not have permission to claim this ticket."
+    );
+  }
+
+  if (ticket.claimedBy) {
+    return ticketEphemeral(
+      interaction,
+      `This ticket has been claimed by <@${ticket.claimedBy}>.`
+    );
+  }
+
+  ticket.claimedBy = interaction.user.id;
+  ticket.claimedByTag = interaction.user.tag;
+  saveTickets();
+
+  await interaction.message.edit({
+    embeds: [createTicketEmbed(ticket)],
+    components: createTicketControls(ticket)
+  });
+
+  await ticketEphemeral(
+    interaction,
+    `You have successfully claimed ticket \`${channelId}\`.`
+  );
+
+  await interaction.channel.send({
+    content: `This ticket has been claimed by <@${interaction.user.id}>.`,
+    allowedMentions: {
+      users: [interaction.user.id]
+    }
+  });
+}
+
+// --------------------------------------------------
+// CHANGE TICKET PRIORITY
+// --------------------------------------------------
+
+async function changeTicketPriority(interaction, channelId) {
+  const ticket = getTicket(channelId);
+
+  if (!ticket || ticket.closed) {
+    return ticketEphemeral(
+      interaction,
+      "This ticket is no longer open."
+    );
+  }
+
+  if (!isTicketStaff(interaction.member, ticket.categoryKey)) {
+    return ticketEphemeral(
+      interaction,
+      "Only authorized staff members can change ticket priority."
+    );
+  }
+
+  const selected = interaction.values[0];
+
+  const priority = TICKET_PRIORITIES.find(
+    item => item.toLowerCase() === selected
+  );
+
+  if (!priority) {
+    return ticketEphemeral(
+      interaction,
+      "That priority is invalid."
+    );
+  }
+
+  ticket.priority = priority;
+  saveTickets();
+
+  await interaction.message.edit({
+    embeds: [createTicketEmbed(ticket)],
+    components: createTicketControls(ticket)
+  });
+
+  await ticketEphemeral(
+    interaction,
+    `Ticket priority changed to ${priority}.`
+  );
+
+  await interaction.channel.send({
+    content: `Ticket priority was changed to **${priority}** by <@${interaction.user.id}>.`,
+    allowedMentions: {
+      users: [interaction.user.id]
+    }
+  });
+}
+
+// --------------------------------------------------
+// CLOSE TICKET MODAL
+// --------------------------------------------------
+
+async function showTicketCloseModal(interaction, channelId) {
+  const ticket = getTicket(channelId);
+
+  if (!ticket || ticket.closed) {
+    return ticketEphemeral(
+      interaction,
+      "This ticket is no longer open."
+    );
+  }
+
+  if (!isTicketStaff(interaction.member, ticket.categoryKey)) {
+    return ticketEphemeral(
+      interaction,
+      "Only authorized staff members can close tickets."
+    );
+  }
+
+  const modal = new ModalBuilder()
+    .setCustomId(`ticket_close_modal:${channelId}`)
+    .setTitle("Close Support Ticket");
+
+  const reasonInput = new TextInputBuilder()
+    .setCustomId("close_reason")
+    .setLabel("Reason for closing")
+    .setPlaceholder("Explain why this ticket is being closed...")
+    .setStyle(TextInputStyle.Paragraph)
+    .setMinLength(3)
+    .setMaxLength(1000)
+    .setRequired(true);
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(reasonInput)
+  );
+
+  await interaction.showModal(modal);
+}
+
+// --------------------------------------------------
+// TICKET TRANSCRIPT HELPERS
+// --------------------------------------------------
+
+async function fetchAllTicketMessages(channel) {
+  const messages = [];
+  let before;
+
+  while (true) {
+    const options = { limit: 100 };
+
+    if (before) {
+      options.before = before;
+    }
+
+    const batch = await channel.messages.fetch(options);
+
+    if (batch.size === 0) {
+      break;
+    }
+
+    messages.push(...batch.values());
+    before = batch.last().id;
+
+    if (batch.size < 100) {
+      break;
+    }
+  }
+
+  return messages.sort(
+    (a, b) => a.createdTimestamp - b.createdTimestamp
+  );
+}
+
+function buildTicketTranscript(messages, ticket, reason, closer) {
+  const category = TICKET_CATEGORIES[ticket.categoryKey];
+
+  const lines = [
+    "ZEXVERAI SUPPORT TICKET TRANSCRIPT",
+    "==================================",
+    `Ticket ID: ${ticket.channelId}`,
+    `Created By: ${ticket.username} (${ticket.userId})`,
+    `Claimed By: ${ticket.claimedByTag || "Not claimed"}`,
+    `Ticket Date: ${new Date(ticket.createdAt).toISOString()}`,
+    `Category: ${category?.label || ticket.categoryKey}`,
+    `Priority: ${ticket.priority}`,
+    `Reason: ${reason}`,
+    `Closed By: ${closer.tag} (${closer.id})`,
+    "",
+    "CONVERSATION",
+    "============",
+    ""
+  ];
+
+  for (const message of messages) {
+    const timestamp = new Date(
+      message.createdTimestamp
+    ).toISOString();
+
+    lines.push(
+      `[${timestamp}] ${message.author.tag} (${message.author.id}):`
+    );
+
+    if (message.content) {
+      lines.push(message.content);
+    } else {
+      lines.push("[No text content]");
+    }
+
+    for (const attachment of message.attachments.values()) {
+      lines.push(`Attachment: ${attachment.url}`);
+    }
+
+    for (const embed of message.embeds) {
+      if (embed.title) {
+        lines.push(`Embed title: ${embed.title}`);
+      }
+
+      if (embed.description) {
+        lines.push(`Embed description: ${embed.description}`);
+      }
+    }
+
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
+// --------------------------------------------------
+// CLOSE TICKET AND SAVE TRANSCRIPT
+// --------------------------------------------------
+
+async function closeTicket(interaction, channelId, reason) {
+  const ticket = getTicket(channelId);
+
+  if (!ticket || ticket.closed) {
+    return ticketEphemeral(
+      interaction,
+      "This ticket is already closed."
+    );
+  }
+
+  if (!isTicketStaff(interaction.member, ticket.categoryKey)) {
+    return ticketEphemeral(
+      interaction,
+      "Only authorized staff members can close tickets."
+    );
+  }
+
+  await interaction.deferReply({
+    flags: MessageFlags.Ephemeral
+  });
+
+  const channel = await interaction.guild.channels
+    .fetch(channelId)
+    .catch(() => null);
+
+  if (!channel || !channel.isTextBased()) {
+    return interaction.editReply({
+      content: "The ticket channel could not be found."
+    });
+  }
+
+  let messages;
+
+  try {
+    messages = await fetchAllTicketMessages(channel);
+  } catch (error) {
+    console.error("Could not fetch ticket messages:", error);
+
+    return interaction.editReply({
+      content:
+        "I couldn't read the ticket conversation. The ticket has not been deleted. Check the bot's View Channel and Read Message History permissions."
+    });
+  }
+
+  const transcript = buildTicketTranscript(
+    messages,
+    ticket,
+    reason,
+    interaction.user
+  );
+
+  const transcriptChannel = await getTextChannel(
+    TICKET_TRANSCRIPT_CHANNEL_ID
+  );
+
+  if (!transcriptChannel) {
+    return interaction.editReply({
+      content:
+        "The transcript channel is unavailable. The ticket has not been deleted."
+    });
+  }
+
+  const transcriptAttachment = new AttachmentBuilder(
+    Buffer.from(transcript, "utf8"),
+    {
+      name: `ticket-${ticket.channelId}-transcript.txt`
+    }
+  );
+
+  const category = TICKET_CATEGORIES[ticket.categoryKey];
+
+  const logEmbed = new EmbedBuilder()
+    .setColor(0xf28c28)
+    .setTitle("Ticket Closed")
+    .addFields(
+      {
+        name: "Ticket ID",
+        value: ticket.channelId
+      },
+      {
+        name: "Created By",
+        value: `${ticket.username} (${ticket.userId})`
+      },
+      {
+        name: "Claimed By",
+        value: ticket.claimedByTag || "Not claimed"
+      },
+      {
+        name: "Ticket Date",
+        value: new Date(ticket.createdAt).toISOString()
+      },
+      {
+        name: "Category",
+        value: category?.label || ticket.categoryKey,
+        inline: true
+      },
+      {
+        name: "Priority",
+        value: ticket.priority,
+        inline: true
+      },
+      {
+        name: "Reason",
+        value: reason.slice(0, 1024)
+      },
+      {
+        name: "Closed By",
+        value: `${interaction.user.tag} (${interaction.user.id})`
+      }
+    )
+    .setTimestamp();
+
+  try {
+    await transcriptChannel.send({
+      embeds: [logEmbed],
+      files: [transcriptAttachment],
+      allowedMentions: {
+        parse: []
+      }
+    });
+  } catch (error) {
+    console.error("Could not send ticket transcript:", error);
+
+    return interaction.editReply({
+      content:
+        "The transcript could not be saved. The ticket has not been deleted. Check the bot's permissions in the transcript channel."
+    });
+  }
+
+  ticket.closed = true;
+  ticket.closedAt = Date.now();
+  ticket.closedBy = interaction.user.id;
+  ticket.closedByTag = interaction.user.tag;
+  ticket.closeReason = reason;
+  saveTickets();
+
+  await interaction.editReply({
+    content: "The ticket has been closed and its transcript has been saved."
+  });
+
+  try {
+    await channel.send(
+      `This ticket has been closed by ${interaction.user.tag}. The channel will be deleted in 5 seconds.`
+    );
+  } catch (error) {
+    console.error("Could not send closing notice:", error.message);
+  }
+
+  setTimeout(async () => {
+    try {
+      await channel.delete(
+        "Ticket closed; transcript saved successfully."
+      );
+    } catch (error) {
+      console.error("Could not delete closed ticket:", error);
+    }
+  }, TICKET_DELETE_DELAY);
+}
+
+// --------------------------------------------------
+// TICKET REMINDER
+// --------------------------------------------------
+
+async function checkTicketReminders() {
+  const now = Date.now();
+
+  for (const ticket of Object.values(ticketState.tickets)) {
+    if (
+      ticket.closed ||
+      ticket.reminderSent ||
+      ticket.staffResponded
+    ) {
+      continue;
+    }
+
+    if (now - ticket.createdAt < TICKET_REMINDER_DELAY) {
+      continue;
+    }
+
+    const channel = await client.channels
+      .fetch(ticket.channelId)
+      .catch(() => null);
+
+    if (!channel || !channel.isTextBased()) {
+      continue;
+    }
+
+    try {
+      await channel.send(
+        "Reminder: This ticket is waiting for a response from our staff team."
+      );
+
+      ticket.reminderSent = true;
+      saveTickets();
+    } catch (error) {
+      console.error("Could not send ticket reminder:", error);
+    }
+  }
+}
+
+// --------------------------------------------------
 // ANNOUNCE
 // --------------------------------------------------
 
@@ -344,9 +1230,9 @@ async function publishAnnouncement(interaction, channelId) {
   if (
     !botMember ||
     !channel.permissionsFor(botMember)?.has([
-      "ViewChannel",
-      "SendMessages",
-      "EmbedLinks"
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.EmbedLinks
     ])
   ) {
     return interaction.reply({
@@ -464,7 +1350,6 @@ async function setupKeepAlive() {
 
 // --------------------------------------------------
 // QUIZZY QUESTIONS
-// Only user-provided facts are included.
 // --------------------------------------------------
 
 const questions = [
@@ -861,7 +1746,7 @@ async function finishGiveaway(giveawayId) {
 }
 
 // --------------------------------------------------
-// SCHEDULER — RESTORES AFTER RESTART
+// SCHEDULER
 // --------------------------------------------------
 
 async function schedulerTick() {
@@ -887,6 +1772,8 @@ async function schedulerTick() {
       await finishGiveaway(id);
     }
   }
+
+  await checkTicketReminders();
 }
 
 // --------------------------------------------------
@@ -895,6 +1782,54 @@ async function schedulerTick() {
 
 client.on("interactionCreate", async interaction => {
   try {
+    // TICKET CATEGORY SELECT
+    if (
+      interaction.isStringSelectMenu() &&
+      interaction.customId === "ticket_category_select"
+    ) {
+      await createTicket(
+        interaction,
+        interaction.values[0]
+      );
+      return;
+    }
+
+    // TICKET PRIORITY SELECT
+    if (
+      interaction.isStringSelectMenu() &&
+      interaction.customId.startsWith("ticket_priority:")
+    ) {
+      const channelId =
+        interaction.customId.split(":")[1];
+
+      await changeTicketPriority(interaction, channelId);
+      return;
+    }
+
+    // TICKET BUTTONS
+    if (interaction.isButton()) {
+      if (
+        interaction.customId.startsWith("ticket_claim:")
+      ) {
+        const channelId =
+          interaction.customId.split(":")[1];
+
+        await claimTicket(interaction, channelId);
+        return;
+      }
+
+      if (
+        interaction.customId.startsWith("ticket_close:")
+      ) {
+        const channelId =
+          interaction.customId.split(":")[1];
+
+        await showTicketCloseModal(interaction, channelId);
+        return;
+      }
+    }
+
+    // SLASH COMMANDS
     if (interaction.isChatInputCommand()) {
       // ANNOUNCE COMMAND
       if (interaction.commandName === "announce") {
@@ -1043,7 +1978,7 @@ client.on("interactionCreate", async interaction => {
       }
     }
 
-    // BUTTONS
+    // EXISTING BUTTONS
     if (interaction.isButton()) {
       if (interaction.customId === "keep_alive") {
         const userId = interaction.user.id;
@@ -1209,6 +2144,33 @@ client.on("interactionCreate", async interaction => {
 
     // MODAL SUBMISSIONS
     if (interaction.isModalSubmit()) {
+      // TICKET CLOSE MODAL
+      if (
+        interaction.customId.startsWith("ticket_close_modal:")
+      ) {
+        const channelId =
+          interaction.customId.split(":")[1];
+
+        const reason = interaction.fields
+          .getTextInputValue("close_reason")
+          .trim();
+
+        if (reason.length < 3) {
+          return ticketEphemeral(
+            interaction,
+            "Please provide a closing reason of at least 3 characters."
+          );
+        }
+
+        await closeTicket(
+          interaction,
+          channelId,
+          reason
+        );
+        return;
+      }
+
+      // ANNOUNCEMENT MODAL
       if (
         interaction.customId.startsWith("announce_submit:")
       ) {
@@ -1234,6 +2196,7 @@ client.on("interactionCreate", async interaction => {
         );
       }
 
+      // QUIZZY ANSWER MODAL
       if (interaction.customId === "quiz_submit") {
         const quiz = state.activeQuiz;
 
@@ -1316,6 +2279,25 @@ client.on("interactionCreate", async interaction => {
 });
 
 // --------------------------------------------------
+// STAFF RESPONSE TRACKING FOR TICKETS
+// --------------------------------------------------
+
+client.on("messageCreate", message => {
+  if (!message.guild || message.author.bot) return;
+
+  const ticket = getTicket(message.channel.id);
+
+  if (!ticket || ticket.closed || ticket.staffResponded) {
+    return;
+  }
+
+  if (isTicketStaff(message.member, ticket.categoryKey)) {
+    ticket.staffResponded = true;
+    saveTickets();
+  }
+});
+
+// --------------------------------------------------
 // STARTUP
 // --------------------------------------------------
 
@@ -1339,7 +2321,17 @@ client.once("clientReady", async () => {
     );
   }
 
-  await setupKeepAlive();
+  try {
+    await setupKeepAlive();
+  } catch (error) {
+    console.error("Keep AI Alive setup failed:", error);
+  }
+
+  try {
+    await setupTicketPanel();
+  } catch (error) {
+    console.error("Ticket panel setup failed:", error);
+  }
 
   if (
     state.activeQuiz &&
@@ -1348,7 +2340,11 @@ client.once("clientReady", async () => {
     await closeQuiz();
   }
 
-  await schedulerTick();
+  try {
+    await schedulerTick();
+  } catch (error) {
+    console.error("Initial scheduler run failed:", error);
+  }
 
   setInterval(() => {
     schedulerTick().catch(error =>
@@ -1365,12 +2361,14 @@ client.on("error", error => {
 
 process.on("SIGTERM", () => {
   saveState();
+  saveTickets();
   client.destroy();
   process.exit(0);
 });
 
 process.on("SIGINT", () => {
   saveState();
+  saveTickets();
   client.destroy();
   process.exit(0);
 });
