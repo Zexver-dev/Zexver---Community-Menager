@@ -1,4 +1,3 @@
-
 const {
   Client,
   GatewayIntentBits,
@@ -48,10 +47,12 @@ const GIVEAWAY_ROLES = [
 const ANNOUNCE_ROLES = GIVEAWAY_ROLES;
 
 const DAILY_REWARD = [20000, 10000, 5000, 2000, 2000];
+
 const KEEP_COOLDOWN = 5 * 60 * 60 * 1000;
 const QUIZ_INTERVAL = 2 * 60 * 60 * 1000;
 const QUIZ_DURATION = 90 * 60 * 1000;
 const DAY = 24 * 60 * 60 * 1000;
+const WEEK = 7 * DAY;
 
 // Ticket configuration
 const TICKET_PANEL_CHANNEL_ID = "1560338921173553203";
@@ -122,8 +123,15 @@ const initialState = {
   keepMessageId: null,
   activeQuiz: null,
   nextQuizAt: Date.now() + QUIZ_INTERVAL,
+
+  // Weekly Quizzy leaderboard
+  weeklyScores: {},
+  nextWeeklyAt: Date.now() + WEEK,
+
+  // Legacy data retained for migration from the old daily leaderboard.
   dailyScores: {},
   nextDailyAt: Date.now() + DAY,
+
   lastReminder: -1,
   giveaways: {}
 };
@@ -139,6 +147,48 @@ try {
   }
 } catch (error) {
   console.error("Could not read saved state:", error);
+}
+
+// Migrate the existing daily scores to the weekly leaderboard.
+// This prevents accumulated points from being discarded on deployment.
+if (
+  (!state.weeklyScores ||
+    typeof state.weeklyScores !== "object" ||
+    Array.isArray(state.weeklyScores))
+) {
+  state.weeklyScores = {};
+}
+
+if (
+  Object.keys(state.weeklyScores).length === 0 &&
+  state.dailyScores &&
+  typeof state.dailyScores === "object" &&
+  Object.keys(state.dailyScores).length > 0
+) {
+  state.weeklyScores = state.dailyScores;
+}
+
+if (
+  !Number.isFinite(state.nextWeeklyAt) ||
+  state.nextWeeklyAt <= 0
+) {
+  state.nextWeeklyAt = Date.now() + WEEK;
+}
+
+if (!state.giveaways || typeof state.giveaways !== "object") {
+  state.giveaways = {};
+}
+
+if (!state.keepClicks || typeof state.keepClicks !== "object") {
+  state.keepClicks = {};
+}
+
+if (!Number.isFinite(state.keepTotal)) {
+  state.keepTotal = 0;
+}
+
+if (!Number.isFinite(state.nextQuizAt)) {
+  state.nextQuizAt = Date.now() + QUIZ_INTERVAL;
 }
 
 function saveState() {
@@ -318,7 +368,7 @@ function parseDuration(input) {
   } else if (["d", "day", "days"].includes(unit)) {
     multiplier = DAY;
   } else {
-    multiplier = 7 * DAY;
+    multiplier = WEEK;
   }
 
   const result = amount * multiplier;
@@ -361,16 +411,16 @@ async function getTextChannel(channelId) {
   }
 }
 
-function getDailyScore(userId) {
-  if (!state.dailyScores[userId]) {
-    state.dailyScores[userId] = {
+function getWeeklyScore(userId) {
+  if (!state.weeklyScores[userId]) {
+    state.weeklyScores[userId] = {
       points: 0,
       correct: 0,
       totalTimeMs: 0
     };
   }
 
-  return state.dailyScores[userId];
+  return state.weeklyScores[userId];
 }
 
 // --------------------------------------------------
@@ -624,6 +674,18 @@ async function createTicket(interaction, categoryKey) {
     return ticketEphemeral(
       interaction,
       "You already have 3 open tickets. Close an existing ticket before creating another one."
+    );
+  }
+
+  // Prevent multiple open tickets for the same category.
+  const alreadyHasCategory = openTickets.some(
+    ticket => ticket.categoryKey === categoryKey
+  );
+
+  if (alreadyHasCategory) {
+    return ticketEphemeral(
+      interaction,
+      `You already have an open ${category.label} ticket. Please use that ticket instead of creating another one in the same category.`
     );
   }
 
@@ -1582,32 +1644,37 @@ async function closeQuiz() {
   saveState();
 }
 
+// Weekly leaderboard reminders
 const reminderMessages = [
-  "Please move your butt, stop being a statue, and start handing out those rewards!",
-  "The leaderboard is ready, the winners are waiting, and you're still procrastinating.",
-  "Roses are red, the leaderboard is bright, hand out those rewards and do something right.",
-  "Hey, move your feet, the winners are waiting for their daily treat.",
-  "Less sitting, more rewarding. Chop-chop!",
-  "The winners did their part, now hand out the rewards and show some heart.",
-  "Your mission, should you choose to accept it: stop chilling and distribute the rewards.",
-  "No more hiding, no more delay. Hand those rewards out today!",
-  "The points are counted, the winners are known. Get off your throne and hand out what's owed!",
-  "Please move your butt and do your duty. The leaderboard deserves your beauty."
+  "The weekly leaderboard is ready. Please distribute the rewards!",
+  "The weekly winners are waiting for their Tokens. Time to hand them out!",
+  "Seven days of quizzes are complete. Please distribute the weekly rewards.",
+  "The points have been counted. Please send out the weekly rewards.",
+  "The weekly results are ready. Please award the top five participants.",
+  "Time to reward this week's quiz champions!",
+  "The weekly leaderboard is complete. Please distribute the Tokens.",
+  "Another week of quizzes has passed. Please award the winners.",
+  "The weekly standings are ready. Please take care of the rewards.",
+  "Please distribute the weekly Quizzy rewards to the top five players."
 ];
 
-async function postDailyLeaderboard() {
+async function postWeeklyLeaderboard() {
   const channel = await getTextChannel(QUIZ_CHANNEL_ID);
 
-  const entries = Object.entries(state.dailyScores)
+  const entries = Object.entries(state.weeklyScores || {})
     .map(([userId, score]) => ({ userId, ...score }))
-    .sort((a, b) => b.points - a.points);
+    .sort(
+      (a, b) =>
+        b.points - a.points ||
+        (a.totalTimeMs || 0) - (b.totalTimeMs || 0)
+    );
 
   if (channel) {
     let description = "";
 
     if (entries.length === 0) {
       description =
-        "No quiz points were recorded during this period.";
+        "No quiz points were recorded during this weekly period.";
     } else {
       description = entries
         .slice(0, 5)
@@ -1617,6 +1684,13 @@ async function postDailyLeaderboard() {
           return `**${index + 1}.** <@${entry.userId}> — ${entry.points} points | ${reward.toLocaleString("en-US")} Tokens`;
         })
         .join("\n");
+
+      description += [
+        "",
+        "",
+        "**Weekly rewards**",
+        "Rewards are distributed at the end of each seven-day period."
+      ].join("\n");
     }
 
     const reminderIndex =
@@ -1626,17 +1700,31 @@ async function postDailyLeaderboard() {
 
     await channel.send({
       embeds: [
-        makeEmbed("Quizzy — Daily Leaderboard", description)
+        makeEmbed("Quizzy — Weekly Leaderboard", description)
       ]
     });
 
-    await channel.send(
-      `<@1191814686644117537> ${reminderMessages[reminderIndex]}`
-    );
+    await channel.send({
+      content:
+        `<@1191814686644117537> ${reminderMessages[reminderIndex]}`,
+      allowedMentions: {
+        users: ["1191814686644117537"]
+      }
+    });
   }
 
+  // Clear the completed period only after preparing the weekly results.
+  state.weeklyScores = {};
+
+  // Clear the legacy property as well, so an old saved score set
+  // cannot be migrated again after a weekly payout.
   state.dailyScores = {};
-  state.nextDailyAt = Date.now() + DAY;
+
+  state.nextWeeklyAt = Date.now() + WEEK;
+
+  // Keep the legacy timer in sync for older state files/tools.
+  state.nextDailyAt = state.nextWeeklyAt;
+
   saveState();
 }
 
@@ -1763,8 +1851,9 @@ async function schedulerTick() {
     await postQuiz();
   }
 
-  if (now >= state.nextDailyAt) {
-    await postDailyLeaderboard();
+  // Weekly rewards and leaderboard, not daily.
+  if (now >= state.nextWeeklyAt) {
+    await postWeeklyLeaderboard();
   }
 
   for (const [id, giveaway] of Object.entries(state.giveaways)) {
@@ -2240,7 +2329,7 @@ client.on("interactionCreate", async interaction => {
         };
 
         if (correct) {
-          const score = getDailyScore(
+          const score = getWeeklyScore(
             interaction.user.id
           );
 
@@ -2303,6 +2392,10 @@ client.on("messageCreate", message => {
 
 client.once("clientReady", async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  console.log(
+    `Next weekly Quizzy leaderboard: ${new Date(state.nextWeeklyAt).toISOString()}`
+  );
 
   try {
     await rest.put(
